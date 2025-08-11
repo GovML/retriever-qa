@@ -5,32 +5,46 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
-from typing import List
+from sentence_transformers import SentenceTransformer, util
 
+'''
+todo:
+- extraction improvement:
+    - when a table continues to the next page, include it in the previous table
+    - preserve the order of image and table inside the text
+'''
 
 class PDFExtractor:
     def __init__(self, output_folder, device=None):
-        self.device = "cuda" if device is None else device
+        self.device = "cuda"
         self.torch_dtype = torch.float16
         self.output_folder = output_folder
         print(f'Loading onto {self.device}')
+        
+        print("Loading Florence-2-large model and processor...")
+        # self.model = AutoModelForCausalLM.from_pretrained(
+        #     "microsoft/Florence-2-large",
+        #     torch_dtype=self.torch_dtype,
+        #     trust_remote_code=True,
+        #     revision="main"
+        # ).to(self.device)
 
-        # Placeholder: Florence model loading skipped for now
-        print("Loading Florence-2-large model and processor... [skipped]")
-        # self.model = AutoModelForCausalLM.from_pretrained(...)
-        # self.processor = AutoProcessor.from_pretrained(...)
-        print("Model and processor loading skipped.")
+        # self.processor = AutoProcessor.from_pretrained(
+        #     "microsoft/Florence-2-large",
+        #     trust_remote_code=True,
+        #     revision="main"
+        # )
+        print("Model and processor loaded successfully.")
 
         print("Loading embedding model...")
         self.embed_model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
         self.embed_model_max_tokens = 512
         print("Embedding model loaded successfully.")
 
-        print(f"Creating output folder: {self.output_folder}")
+        print(f"Making output Folder {self.output_folder}")
         os.makedirs(self.output_folder, exist_ok=True)
 
-    def process_pdfs(self, input_paths: List[str]):
+    def process_pdfs(self, input_paths):
         """
         Accepts a list of file paths or directories.
         For directories, scans for all PDF files inside.
@@ -57,8 +71,12 @@ class PDFExtractor:
         for pdf_path in pdf_list:
             print(f"\nProcessing PDF: {pdf_path}")
             doc_name = os.path.splitext(os.path.basename(pdf_path))[0]
-            chunk_data, _ = self._extract_from_pdf(pdf_path)
-            all_data[doc_name] = chunk_data
+            pdf_data, full_doc_text = self._extract_from_pdf(pdf_path)
+
+            embedding = self._get_document_embedding(full_doc_text)
+            pdf_data["embedding"] = embedding.tolist()
+
+            all_data[doc_name] = pdf_data
 
         combined_output_path = os.path.join(self.output_folder, "combined_output.json")
         with open(combined_output_path, 'w', encoding='utf-8') as f:
@@ -68,7 +86,8 @@ class PDFExtractor:
 
     def _extract_from_pdf(self, pdf_path):
         doc = fitz.open(pdf_path)
-        full_text = ""
+        pdf_data = {}
+        full_text_accumulator = []
 
         for page_num, page in enumerate(tqdm(doc, desc='Page Extraction')):
             page_text = ""
@@ -99,33 +118,27 @@ class PDFExtractor:
                     markdown_table = table.to_pandas().to_markdown(index=False)
                     table_text += f"[Extracted Table]\n{markdown_table}\n\n"
 
-            page_full = f"{page_text}\n\n{image_text}\n\n{table_text}".strip()
-            full_text += f"\n\n[Page {page_num + 1}]\n{page_full}"
+            full_page_text = f"{page_text}\n\n{image_text}\n\n{table_text}".strip()
 
-        # Create sliding window chunks
-        chunks = self._sliding_window_chunking(full_text)
-        chunk_data = {
-            f"chunk_{i}": {
-                "text": chunk,
-                "embedding": self.embed_model.encode(chunk).tolist()
-            } for i, chunk in enumerate(chunks)
-        }
+        # Create a dictionary with keys like "chunk_0", "chunk_1", ...
+        pdf_data = {f"chunk_{i}": chunk for i, chunk in enumerate(full_page_text)}
 
-        return chunk_data, full_text
+        return pdf_data
 
-    def _sliding_window_chunking(self, text, chunk_size=1000, overlap=200):
+    def _get_document_embedding(self, full_text):
         """
-        Splits the input text using a sliding window approach.
+        Computes document embedding. If the text is too long, splits it into chunks and averages the embeddings.
         """
-        words = text.split()
-        chunks = []
-        start = 0
-        while start < len(words):
-            end = start + chunk_size
-            chunk = " ".join(words[start:end])
-            chunks.append(chunk)
-            start += chunk_size - overlap  # Slide window
-        return chunks
+        words = full_text.split()
+        max_words = self.embed_model_max_tokens
+        if len(words) <= max_words:
+            embedding = self.embed_model.encode(full_text)
+        else:
+            chunks = [" ".join(words[i:i+max_words]) for i in range(0, len(words), max_words)]
+            embeddings = [self.embed_model.encode(chunk) for chunk in chunks]
+            embedding = torch.tensor(embeddings).mean(dim=0)
+
+        return embedding
 
     def _describe_images(self, image_objs):
         descriptions = []
@@ -143,7 +156,6 @@ class PDFExtractor:
 
 
 # Example usage
-if __name__ == "__main__":
-    extractor = PDFExtractor(output_folder='./tmp_extract_pdf')
-    pdf_inputs = ['./nap_alb.pdf']
-    extractor.process_pdfs(pdf_inputs)
+extractor = PDFExtractor(output_folder='./tmp_extract_pdf')
+pdf_inputs = ['./nap_alb.pdf']
+result = extractor.process_pdfs(pdf_inputs)

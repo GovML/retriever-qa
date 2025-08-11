@@ -15,6 +15,8 @@ import uvicorn
 from deepseek_client import DeepSeekClient
 
 
+
+
 class PDFRetriever:
     def __init__(self, json_path: str):
         self.json_path = json_path
@@ -36,24 +38,32 @@ class PDFRetriever:
         self.doc_store = InMemoryDocumentStore()
 
         all_docs = []
+        first_item = list(self.data.items())[0]
+        print("First document key and structure:", first_item[0], type(first_item[1]))
+
         for doc_name, doc_content in self.data.items():
-            if "embedding" not in doc_content:
-                print(f"Warning: No embedding found for {doc_name}, skipping.")
-                continue
+            # doc_content is a dict of chunks: {"chunk_0": {...}, "chunk_1": {...}}
+            for chunk_id, chunk_data in doc_content.items():
+                if not isinstance(chunk_data, dict):
+                    print(f"Skipping malformed chunk {chunk_id} in {doc_name}")
+                    continue
 
-            embedding = np.array(doc_content["embedding"])
-            combined_text = "\n".join(
-                page_data.get("page_extraction", "")
-                for key, page_data in doc_content.items()
-                if key.startswith("page_")
-            )
+                if "embedding" not in chunk_data or "text" not in chunk_data:
+                    print(f"Warning: No embedding/text found for {doc_name} - {chunk_id}, skipping.")
+                    continue
 
-            haystack_doc = Document(
-                content=combined_text,
-                embedding=embedding,
-                meta={"name": doc_name}
-            )
-            all_docs.append(haystack_doc)
+                embedding = np.array(chunk_data["embedding"], dtype=np.float32)
+                text = chunk_data["text"]
+
+                haystack_doc = Document(
+                    content=text,
+                    embedding=embedding,
+                    meta={
+                        "name": doc_name,
+                        "chunk_id": chunk_id
+                    }
+                )
+                all_docs.append(haystack_doc)
 
         print(f"Writing {len(all_docs)} documents to the store...")
         self.doc_store.write_documents(all_docs)
@@ -76,35 +86,32 @@ class PDFRetriever:
         })
 
         documents = result["retriever"]["documents"]
+        print([d for d in documents])
         return documents
 
-    def synthesize(self, question: str, document_names: List[str]) -> str:
+    def synthesize(self, question: str, documents: List[Document]) -> str:
         """
-        Synthesizes an answer from the specified document names using DeepSeekClient.
+        Synthesizes an answer from the provided list of Haystack `Document` objects using DeepSeekClient.
         """
-        matched_docs = [
-            doc for doc in self.doc_store.filter_documents(filters={"name": {"$in": document_names}})
-        ]
-
-        if not matched_docs:
-            return "No matching documents found."
+        if not documents:
+            return "No matching documents provided."
 
         context = ""
-        for i, doc in enumerate(matched_docs):
+        for i, doc in enumerate(documents):
             doc_text = doc.content.strip().replace("\n", " ")
             context += f"[Source {i+1} - {doc.meta.get('name', 'unknown')}]: {doc_text}\n\n"
 
-        prompt = f"""You are a citation-providing and assistant answering questions using the content of the documents provided. 
-        The content you will be provided is long. First, find the section mentioning themese related to the question. Using those themes, then answer the question.
-        You must cite your source from within the content of the documents. 
-        
-        Here is the content of the document:
+        prompt = f"""You are a citation-providing assistant answering questions using the content of the documents provided. 
+The content you will be provided is long. First, find the section mentioning themes related to the question. Using those themes, then answer the question.
+You must cite your source from within the content of the documents.
 
-        {context}
+Here is the content of the document:
 
-        Question: {question}
-        Answer:"""
-        print(prompt)
+{context}
+
+Question: {question}
+Answer:"""
+
         response = self.client.generate(prompt)
         answer = response['text'] if isinstance(response, dict) and 'text' in response else str(response)
         return answer
@@ -121,7 +128,7 @@ def start_api(json_path: str, host: str = "127.0.0.1", port: int = 8000):
 
     class SynthesizeRequest(BaseModel):
         question: str
-        document_names: List[str]
+        top_k: Optional[int] = 5
 
     @app.post("/query")
     def ask_question(query: QueryRequest):
@@ -139,7 +146,8 @@ def start_api(json_path: str, host: str = "127.0.0.1", port: int = 8000):
 
     @app.post("/synthesize")
     def synthesize_answer(request: SynthesizeRequest):
-        answer = retriever.synthesize(request.question, request.document_names)
+        docs = retriever.query(request.question, top_k=request.top_k)
+        answer = retriever.synthesize(request.question, documents=docs)
         return {
             "question": request.question,
             "answer": answer,
@@ -162,7 +170,7 @@ if __name__ == "__main__":
     if args.api:
         start_api(json_path=args.json_path, host=args.host, port=args.port)
     else:
+        print(f'Initializing Document Store from {args.json_path}')
         retriever = PDFRetriever(json_path=args.json_path)
         docs = retriever.query("What is the main purpose of the NAP for Albania?", top_k=3)
-        doc_names = [doc.meta["name"] for doc in docs]
-        print(retriever.synthesize("What is the main purpose of the NAP for Albania?", document_names=doc_names))
+        print(retriever.synthesize("What is the main purpose of the NAP for Albania?", documents=docs))
